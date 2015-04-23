@@ -4,6 +4,11 @@ Dropbox backup
 Simple tool that can backup your local system to Dropbox.
 It use [Dropbox Core API](https://www.dropbox.com/developers/core)
 
+Instalation
+===========
+
+You need to install Python [Dropbox SDK](https://www.dropbox.com/developers/core/sdks/python)
+
 Usage
 =====
 
