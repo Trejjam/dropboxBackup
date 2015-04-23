@@ -15,4 +15,6 @@ Parameters
 ==========
 
 You could use parameters:
+```sh
 -d = 'path'	Which specify local path
+```
