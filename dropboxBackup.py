@@ -14,6 +14,7 @@ import functools
 import getopt
 import errno
 import time
+import urllib3
 
 # Include the Dropbox SDK
 import dropbox
@@ -145,90 +146,115 @@ class DropboxBackup:
 		self.client = self.dropboxManager.getApiClient()
 
 	def backup(self, backupFolder, ignored):
-		if backupFolder in ignored['paths']:
-			print ('Skipped ' + backupFolder) # skipping ignored path
-			return
+		try:
+			if backupFolder in ignored['paths']:
+				print ('Skipped ' + backupFolder) # skipping ignored path
+				return
 
-		ignored['files'].append(self.checksumMetaFile)
+			ignored['files'].append(self.checksumMetaFile)
 
-		checksum = self.getBackupChecksum(backupFolder)
+			checksum = self.getBackupChecksum(backupFolder)
 
-		newChecksum = {}
+			newChecksum = {}
 
-		files = []
-		directories = []
-		for (dirpath, dirnames, filenames) in os.walk(backupFolder):
-			files.extend(filenames)
-			directories.extend(dirnames)
-			break
+			files = []
+			directories = []
+			for (dirpath, dirnames, filenames) in os.walk(backupFolder):
+				files.extend(filenames)
+				directories.extend(dirnames)
+				break
 
-		for (oneFile) in files:
-			filePath = os.path.join(backupFolder, oneFile)
-			if os.path.isfile(filePath):
-				if oneFile in ignored['files']:
-					if oneFile in newChecksum:
+			for (oneFile) in files:
+				filePath = os.path.join(backupFolder, oneFile)
+				if os.path.isfile(filePath):
+					if oneFile in ignored['files']:
+						if oneFile in newChecksum:
+							del newChecksum[oneFile]
+
+						continue # skipping ignored files
+					newChecksum[oneFile] = self.generateChecksum(filePath)
+					if newChecksum[oneFile] == None:
+						print ('Unable sum hash: ' + filePath)
 						del newChecksum[oneFile]
 
-					continue # skipping ignored files
-				newChecksum[oneFile] = self.generateChecksum(filePath)
-				if newChecksum[oneFile] == None:
-					print ('Unable sum hash: ' + filePath)
-					del newChecksum[oneFile]
+			if newChecksum != checksum:
+				allChecksum = copy.copy(newChecksum)
+				allChecksum.update(checksum)
 
-		if newChecksum != checksum:
-			allChecksum = copy.copy(newChecksum)
-			allChecksum.update(checksum)
+				actualChecksum = copy.copy(checksum)
 
-			actualChecksum = copy.copy(checksum)
+				try:
+					for check in allChecksum:
+						if (check in checksum):
+							if (check not in newChecksum):
+								self.snapshot(backupFolder, check)
+								del actualChecksum[check]
 
-			try:
-				for check in allChecksum:
-					if (check in checksum):
-						if (check not in newChecksum):
-							self.snapshot(backupFolder, check)
-							del actualChecksum[check]
+							else:
+								if checksum[check] == newChecksum[check]:
+									continue
+								else:
+									self.snapshot(backupFolder, check)
+									if self.upload(backupFolder, check):
+										actualChecksum[check] = newChecksum[check]
+
+									continue
 
 						else:
-							if checksum[check] == newChecksum[check]:
-								continue
-							else:
-								self.snapshot(backupFolder, check)
-								self.upload(backupFolder, check)
+							if self.upload(backupFolder, check):
 								actualChecksum[check] = newChecksum[check]
 
-								continue
+					self.updateChecksum(backupFolder, newChecksum)
+				except KeyboardInterrupt as e:
+					kill = input('Do you realy want to kill it? [Y/n]')
 
+					if kill == 'n' or kill == 'N':
+						self.updateChecksum(backupFolder, actualChecksum)
+						self.backup(backupFolder, ignored)
 					else:
-						self.upload(backupFolder, check)
-						actualChecksum[check] = newChecksum[check]
+						self.updateChecksum(backupFolder, actualChecksum)
 
-				self.updateChecksum(backupFolder, newChecksum)
-			except KeyboardInterrupt as e:
+						raise e
 
-				self.updateChecksum(backupFolder, actualChecksum)
+			for (dirname) in self.getFolders(backupFolder):
+				if dirname not in directories:
+					self.snapshot(backupFolder + '/' + dirname, '')
+					print(backupFolder + '/' + dirname)
+
+			for (dirname) in directories:
+				if dirname in ignored['folders']:
+					print ('Skipped ' + backupFolder + '/' + dirname)
+
+					continue
+
+				if os.path.islink(backupFolder + '/' + dirname):
+					print ('Skipped symlink ' + backupFolder + '/' + dirname)
+
+					continue
+
+				self.backup(backupFolder + '/' + dirname, ignored)
+
+		except KeyboardInterrupt as e:
+			kill = input('Do you realy want to kill it? [Y/n]')
+
+			if kill == 'n' or kill == 'N':
+				self.backup(backupFolder, ignored)
+			else:
 
 				raise e
 
-		for (dirname) in self.getFolders(backupFolder):
-			if dirname not in directories:
-				self.snapshot(backupFolder + '/' + dirname, '')
-				print(backupFolder + '/' + dirname)
-
-		for (dirname) in directories:
-			if dirname in ignored['folders']:
-				print ('Skipped ' + backupFolder + '/' + dirname)
-
-				continue
-
-			if os.path.islink(backupFolder + '/' + dirname):
-				print ('Skipped symlink ' + backupFolder + '/' + dirname)
-
-				continue
-
-			self.backup(backupFolder + '/' + dirname, ignored)
-
 	def getFolders(self, backupFolder):
-		resp = self.client.metadata(self.backupFolders['root'] + '/' + self.backupFolders['main'] + '/' + backupFolder)
+		try:
+			resp = self.client.metadata(self.backupFolders['root'] + '/' + self.backupFolders['main'] + '/' + backupFolder)
+		except dropbox.rest.ErrorResponse as e:
+			print (e)
+			if e.status == 404:
+				return []
+			return self.getFolders(backupFolder)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			return self.getFolders(backupFolder)
 
 		folders = []
 
@@ -256,20 +282,36 @@ class DropboxBackup:
 				return {}
 		except (dropbox.rest.ErrorResponse, dropbox.rest.ErrorResponse) as e:
 			print (e)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			return self.getBackupChecksum(backupFolder)
 
-		f = open('/tmp/' + self.checksumMetaFile, 'w+')
-		f.write(json.dumps({}))
-		f.close();
+		#f = open('/tmp/' + self.checksumMetaFile, 'w+')
+		#f.write(json.dumps({}))
+		#f.close();
 
-		f = open('/tmp/' + self.checksumMetaFile, 'rb')
+		#f = open('/tmp/' + self.checksumMetaFile, 'rb')
+		#try:
+		#	response = self.client.put_file(fullChecksumFile, f)
+		#except dropbox.rest.ErrorResponse as e:
+		#	if e.status == 503:
+		#		time.sleep(self.repeatSleep)
+		#		self.getBackupChecksum(backupFolder)
+		#finally:
+		#	f.close()
+
 		try:
-			response = self.client.put_file(fullChecksumFile, f)
+			self.client.file_create_folder(self.backupFolders['root'] + '/' + self.backupFolders['main'] + '/' + backupFolder)
+			print ('Create folder ' + self.backupFolders['root'] + '/' + self.backupFolders['main'] + '/' + backupFolder)
 		except dropbox.rest.ErrorResponse as e:
 			if e.status == 503:
 				time.sleep(self.repeatSleep)
-				self.getBackupChecksum(backupFolder)
-		finally:
-			f.close()
+				return self.getBackupChecksum(backupFolder)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			return self.getBackupChecksum(backupFolder)
 
 		return {}
 
@@ -304,6 +346,10 @@ class DropboxBackup:
 			if e.status == 503:
 				time.sleep(self.repeatSleep)
 				self.updateChecksum(backupFolder, newChecksum)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			self.updateChecksum(backupFolder, newChecksum)
 		finally:
 			f.close()
 
@@ -314,13 +360,41 @@ class DropboxBackup:
 		fromFile = open(pathFrom, 'rb')
 
 		try:
-			self.client.put_file(pathTo, fromFile, overwrite=True)
+			#print(pathTo, fromFile);
+
+			#self.client.put_file(pathTo, fromFile, overwrite=True)
+
+			size = os.path.getsize(pathFrom)
+			uploader = self.client.get_chunked_uploader(fromFile, size)
+			print ("uploading: ", size, ",", pathFrom)
+			isOk = True
+			while uploader.offset < size:
+				try:
+					print(uploader.offset)
+					upload = uploader.upload_chunked(4*1024*1024)
+				except dropbox.rest.ErrorResponse as e:
+					print (e)
+					isOk = False
+					# perform error handling and retry logic
+
+			if isOk:
+				uploader.finish(pathTo, overwrite=True)
+			else:
+				time.sleep(self.repeatSleep)
+				return self.upload(directory, f)
 		except dropbox.rest.ErrorResponse as e:
 			if e.status == 503:
 				time.sleep(self.repeatSleep)
-				self.upload(directory, f)
+				return self.upload(directory, f)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			return self.upload(directory, f)
 
-		print('uploaded ' + directory + '/' + f)
+		if isOk:
+			print('uploaded ' + directory + '/' + f)
+
+		return isOk
 
 	def snapshot(self, directory, f):
 		pathFrom = self.backupFolders['root'] + '/' + self.backupFolders['main'] + '/' + directory + '/' + f
@@ -332,6 +406,10 @@ class DropboxBackup:
 			if e.status == 503:
 				time.sleep(self.repeatSleep)
 				self.snapshot(directory, f)
+		except urllib3.exceptions.MaxRetryError as e:
+			print (e)
+			time.sleep(self.repeatSleep)
+			self.snapshot(directory, f)
 
 		print('snapshot ' + directory + '/' + f + ' ' + self.startTime)
 
